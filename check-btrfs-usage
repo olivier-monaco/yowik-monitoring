@@ -1,0 +1,306 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+
+#   http://www.apache.org/licenses/LICENSE-2.0
+
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+#!/usr/bin/env python3
+import argparse
+import logging
+import re
+
+from subprocess import Popen, PIPE
+from sys import exit
+
+__version__ = '1.0'
+
+critical_messages = []
+warning_messages = []
+
+
+def build_arg_parser():
+    description = """
+Check BTRFS volume usage.
+WARNING: made for single volumes, not tested on RAID volume!
+"""
+    epilog = """
+Limits can be a percent of the total size (eg. 10%), a size in bytes
+(eg. 3029583), a size un KiB (eg. 365K), a size in MiB (eg. 42M)
+or a size in GiB (eg. 3G).
+"""
+
+    parser = argparse.ArgumentParser(description=description, epilog=epilog)
+    parser.add_argument('mount_point', help='Mount point of BTRFS volume')
+    parser.add_argument('-d', '--data-free-warning',
+                        metavar='<limit>', default='15%',
+                        help='Warning if data free space is lower than '
+                             'this limit (default to 15%%)')
+    parser.add_argument('-D', '--data-free-critical',
+                        metavar='<limit>', default='8%',
+                        help='Critical if data free space is lower than '
+                             'this limit (default to 8%%)')
+    parser.add_argument('-f', '--minimum-free-warning',
+                        metavar='<limit>', default='5%',
+                        help='Warning if minimun global free space is '
+                             'lower than this limit (defaults to 5%%)')
+    parser.add_argument('-F', '--minimum-free-critical',
+                        metavar='<limit>', default='3%',
+                        help='Critical if minimum global free space is '
+                             'lower than this limit (defaults to 3%%)')
+    parser.add_argument('-m', '--metadata-free-warning',
+                        metavar='<limit>', default='30%',
+                        help='Warning if metadata free space is lower than '
+                             'this limit (default to 30%%)')
+    parser.add_argument('-M', '--metadata-free-critical',
+                        metavar='<limit>', default='20%',
+                        help='Critical if metadata free space is lower than '
+                             'this limit (default to 20%%)')
+    parser.add_argument('-r', '--reserve-free-warning',
+                        metavar='<limit>', default='95%',
+                        help='Warning if global reserve free space is '
+                             'lower than this limit (default to 95%%)')
+    parser.add_argument('-R', '--reserve-free-critical',
+                        metavar='<limit>', default='80%',
+                        help='Critical if global reserve free space is '
+                             'lower than this limit (default to 80%%)')
+    parser.add_argument('-s', '--system-free-warning', metavar='<limit>',
+                        help='Warning if metadata free space is lower than '
+                             'this limit (not checked by default)')
+    parser.add_argument('-S', '--system-free-critical', metavar='<limit>',
+                        help='Critical if metadata free space is lower than '
+                             'this limit (not checked by default)')
+    parser.add_argument('-u', '--unallocated-warning', metavar='<limit>',
+                        help='Warning if unallocated is lower than this '
+                             'limit (not checked by default)')
+    parser.add_argument('-U', '--unallocated-critical', metavar='<limit>',
+                        help='Critical if unallocated is lower than this '
+                             'limit (not checked by default)')
+    parser.add_argument('-v', '--verbose', action='count', default=0,
+                        help='Increase verbosity (twice for debugging)')
+    parser.add_argument('-V', '--version', action='version',
+                        version='%(prog)s {0}'.format(__version__),
+                        help='Increase verbosity (twice for debugging)')
+    return parser
+
+
+def check_limit(value, max, warning, critical, name):
+    logging.info('Checking {0}'.format(name.lower()))
+    logging.debug('Check limit {0}/{1} againt value {2} (max {3})'
+                  .format(warning, critical, format_bytes(value),
+                          format_bytes(max)))
+    warning = parse_limit(warning, max)
+    critical = parse_limit(critical, max)
+    logging.debug('Raw limits are {0}/{1}'.format(warning, critical))
+    if critical is not None and value < critical:
+        critical_messages.append(
+            '{0} is critical ({1}/{2})'
+            .format(name, format_bytes(value), format_bytes(max))
+        )
+    elif warning is not None and value < warning:
+        warning_messages.append(
+            '{0} is warning ({1}/{2})'
+            .format(name, format_bytes(value), format_bytes(max))
+        )
+
+
+def get_btrfs_fi_usage(mount_point):
+    cmd = ['btrfs', 'filesystem', 'usage', mount_point, '-b']
+
+    p = Popen(cmd, stdout=PIPE)
+    (output, err) = p.communicate()
+    exit = p.wait()
+
+    if exit != 0:
+        raise ValueError('btrfs command returns {0}'.format(exit))
+
+    output = output.decode('utf-8')
+
+    pattern = """Overall:
+ +Device size:\\s+(?P<device_size>[0-9]+)
+ +Device allocated:\\s+(?P<device_allocated>[0-9]+)
+ +Device unallocated:\\s+(?P<device_unallocated>[0-9]+)
+ +Device missing:\\s+(?P<device_missing>[0-9]+)
+ +Used:\\s+(?P<used>[0-9]+)
+ +Free \\(estimated\\):\\s+(?P<free>[0-9]+)\\s\\(min: (?P<free_min>[0-9]+)\\)
+ +Data ratio:\\s+(?P<data_ratio>[0-9]+\\.[0-9]+)
+ +Metadata ratio:\\s+(?P<metadata_ratio>[0-9]+\\.[0-9]+)
+ +Global reserve:\\s+(?P<global_reserve>[0-9]+)\
+\\s\\(used: (?P<global_reserve_used>[0-9]+)\\)
+"""
+    matcher = re.compile(pattern, re.DOTALL)
+    matches = matcher.match(output)
+
+    if matches is None:
+        raise ValueError('Invalid BTRFS output')
+    result = matches.groupdict()
+
+    result['section'] = {}
+    pattern = "(?P<name>[^,\\s\n]+),(?P<type>[^:]+): Size:"\
+        "(?P<size>[0-9]+), Used:(?P<used>[0-9]+)"
+    matcher = re.compile(pattern)
+    for match in matcher.finditer(output):
+        section = match.groupdict()
+        result['section'][section['name']] = section
+
+    return result
+
+
+def parse_limit(limit, max):
+    if limit is None:
+        return None
+    if re.match('^[0-9]+(\\.[0-9]+)?%$', limit):
+        return round(float(limit[0:-1]) * max / 100.0)
+    return parse_unit(limit)
+
+
+def parse_unit(value):
+    if re.match('^[0-9]+(\\.[0-9]+)?G$', value):
+        return int(float(value[0:-1]) * 1024 * 1024 * 1024)
+    elif re.match('^[0-9]+(\\.[0-9]+)?GiB$', value):
+        return int(float(value[0:-3]) * 1024 * 1024 * 1024)
+    elif re.match('^[0-9]+(\\.[0-9]+)?M$', value):
+        return int(float(value[0:-1]) * 1024 * 1024)
+    elif re.match('^[0-9]+(\\.[0-9]+)?MiB$', value):
+        return int(float(value[0:-3]) * 1024 * 1024)
+    elif re.match('^[0-9]+(\\.[0-9]+)?K$', value):
+        return int(float(value[0:-1]) * 1024)
+    elif re.match('^[0-9]+(\\.[0-9]+)?KiB$', value):
+        return int(float(value[0:-3]) * 1024)
+    elif re.match('^[0-9](\\.[0-9]+)?B$', value):
+        return int(float(value[0:-1]))
+    elif re.match('^[0-9](\\.[0-9]+)?$', value):
+        return int(float(value))
+    raise ValueError('Invalid unit in "{0}"'.format(value))
+
+
+def format_bytes(value):
+    if value < 1024 * 1.2:
+        return '{0:.2f}'.format(value)
+    value /= 1024.0
+    if value < 1024 * 1.2:
+        return '{0:.2f}K'.format(value)
+    value /= 1024.0
+    if value < 1024 * 1.2:
+        return '{0:.2f}M'.format(value)
+    value /= 1024.0
+    return '{0:.2f}G'.format(value)
+
+
+def main():
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    level = logging.WARNING
+    if args.verbose > 1:
+        level = logging.DEBUG
+    elif args.verbose > 0:
+        level = logging.INFO
+    logging.basicConfig(level=level, format='%(message)s')
+
+    usage = get_btrfs_fi_usage(args.mount_point)
+
+    global_reserve = int(usage['global_reserve'])
+    global_reserve_used = int(usage['global_reserve_used'])
+    global_reserve_free = global_reserve - global_reserve_used
+    check_limit(
+        global_reserve_free,
+        global_reserve_used,
+        args.reserve_free_warning,
+        args.reserve_free_critical,
+        'Global reserve free space'
+    )
+
+    unallocated = int(usage['device_unallocated'])
+    free_min = int(usage['free_min'])
+    volume_used = int(usage['used'])
+    volume_total = volume_used + unallocated
+    check_limit(
+        free_min,
+        volume_total,
+        args.minimum_free_warning,
+        args.minimum_free_critical,
+        'Minimum free space'
+    )
+
+    check_limit(
+        unallocated,
+        volume_total,
+        args.unallocated_warning,
+        args.unallocated_critical,
+        'Unallocated space'
+    )
+
+    data_used = int(usage['section']['Data']['used'])
+    data_total = int(usage['section']['Data']['size'])
+    data_free = data_total - data_used
+    check_limit(
+        data_free + unallocated,
+        data_total + unallocated,
+        args.data_free_warning,
+        args.data_free_critical,
+        'Data free space'
+    )
+
+    metadata_used = int(usage['section']['Metadata']['used'])
+    metadata_total = int(usage['section']['Metadata']['size'])
+    metadata_free = metadata_total - metadata_used
+    check_limit(
+        metadata_free + unallocated,
+        metadata_used + unallocated,
+        args.metadata_free_warning,
+        args.metadata_free_critical,
+        'Metadata free space'
+    )
+
+    system_used = int(usage['section']['System']['used'])
+    system_total = int(usage['section']['System']['size'])
+    system_free = system_total - system_used
+    check_limit(
+        system_free + unallocated,
+        system_total + unallocated,
+        args.system_free_warning,
+        args.system_free_critical,
+        'System free space'
+    )
+
+    perfdata = {
+        'unallocated': unallocated,
+        'data_used': data_used,
+        'data_free': data_free,
+        'metadata_used': metadata_used,
+        'metadata_free': metadata_free,
+        'system_used': system_used,
+        'system_free': system_free,
+    }
+    total = unallocated + data_total + metadata_total + system_total
+    perfdata = ', '.join(
+        ['{0}={1}B;;;0;{2}'.format(k, v, total) for k, v in perfdata.items()]
+    )
+
+    messages = critical_messages + warning_messages
+    if len(critical_messages):
+        message = 'CRITICAL: {0}|{1}'.format(', '.join(messages), perfdata)
+        status = 2
+    elif len(warning_messages):
+        message = 'WARNING: {0}|{1}'.format(', '.join(messages), perfdata)
+        status = 1
+    else:
+        message = 'OK|{0}'.format(perfdata)
+        status = 0
+
+    print(message)
+    return status
+
+if __name__ == '__main__':
+    exit(main())

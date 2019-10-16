@@ -1,0 +1,192 @@
+# Licensed to the Apache Software Foundation (ASF) under one
+# or more contributor license agreements.  See the NOTICE file
+# distributed with this work for additional information
+# regarding copyright ownership.  The ASF licenses this file
+# to you under the Apache License, Version 2.0 (the
+# "License"); you may not use this file except in compliance
+# with the License.  You may obtain a copy of the License at
+
+#   http://www.apache.org/licenses/LICENSE-2.0
+
+# Unless required by applicable law or agreed to in writing,
+# software distributed under the License is distributed on an
+# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+# KIND, either express or implied.  See the License for the
+# specific language governing permissions and limitations
+# under the License.
+#
+#!/usr/bin/env python3
+import argparse
+import logging
+import re
+
+from subprocess import Popen, PIPE
+from sys import exit
+
+__version__ = '1.0'
+
+critical_messages = []
+warning_messages = []
+
+
+def build_arg_parser():
+    description = """
+Check BTRFS volume fragmentation as the ratio between "free" and
+"minimal free".
+WARNING: made for single volumes, not tested on RAID volume!
+"""
+    epilog = """
+Limits can be a percent of the total size (eg. 10%), a size in bytes
+(eg. 3029583), a size un KiB (eg. 365K), a size in MiB (eg. 42M)
+or a size in GiB (eg. 3G).
+"""
+
+    parser = argparse.ArgumentParser(description=description, epilog=epilog)
+    parser.add_argument('mount_point', help='Mount point of BTRFS volume')
+    parser.add_argument('-c', '--critical',
+                        metavar='<limit>', default='30%',
+                        help='critical if fragmentation exceed this limit '
+                             '(default to 30%%)')
+    parser.add_argument('-w', '--warning',
+                        metavar='<limit>', default='15%',
+                        help='Warning if fragmentation exceed this limit '
+                             '(default to 15%%)')
+    parser.add_argument('-v', '--verbose', action='count', default=0,
+                        help='Increase verbosity (twice for debugging)')
+    parser.add_argument('-V', '--version', action='version',
+                        version='%(prog)s {0}'.format(__version__),
+                        help='Increase verbosity (twice for debugging)')
+    return parser
+
+
+def get_btrfs_fi_usage(mount_point):
+    cmd = ['btrfs', 'filesystem', 'usage', mount_point, '-b']
+
+    p = Popen(cmd, stdout=PIPE)
+    (output, err) = p.communicate()
+    exit = p.wait()
+
+    if exit != 0:
+        raise ValueError('btrfs command returns {0}'.format(exit))
+
+    output = output.decode('utf-8')
+
+    pattern = """Overall:
+ +Device size:\\s+(?P<device_size>[0-9]+)
+ +Device allocated:\\s+(?P<device_allocated>[0-9]+)
+ +Device unallocated:\\s+(?P<device_unallocated>[0-9]+)
+ +Device missing:\\s+(?P<device_missing>[0-9]+)
+ +Used:\\s+(?P<used>[0-9]+)
+ +Free \\(estimated\\):\\s+(?P<free>[0-9]+)\\s\\(min: (?P<free_min>[0-9]+)\\)
+ +Data ratio:\\s+(?P<data_ratio>[0-9]+\\.[0-9]+)
+ +Metadata ratio:\\s+(?P<metadata_ratio>[0-9]+\\.[0-9]+)
+ +Global reserve:\\s+(?P<global_reserve>[0-9]+)\
+\\s\\(used: (?P<global_reserve_used>[0-9]+)\\)
+"""
+    matcher = re.compile(pattern, re.DOTALL)
+    matches = matcher.match(output)
+
+    if matches is None:
+        raise ValueError('Invalid BTRFS output')
+    result = matches.groupdict()
+
+    result['section'] = {}
+    pattern = "(?P<name>[^,\\s\n]+),(?P<type>[^:]+): Size:"\
+        "(?P<size>[0-9]+), Used:(?P<used>[0-9]+)"
+    matcher = re.compile(pattern)
+    for match in matcher.finditer(output):
+        section = match.groupdict()
+        result['section'][section['name']] = section
+
+    return result
+
+
+def parse_limit(limit, max):
+    if limit is None:
+        return None
+    if re.match('^[0-9]+(\\.[0-9]+)?%$', limit):
+        return round(float(limit[0:-1]) * max / 100.0)
+    return parse_unit(limit)
+
+
+def parse_unit(value):
+    if re.match('^[0-9]+(\\.[0-9]+)?G$', value):
+        return int(float(value[0:-1]) * 1024 * 1024 * 1024)
+    elif re.match('^[0-9]+(\\.[0-9]+)?GiB$', value):
+        return int(float(value[0:-3]) * 1024 * 1024 * 1024)
+    elif re.match('^[0-9]+(\\.[0-9]+)?M$', value):
+        return int(float(value[0:-1]) * 1024 * 1024)
+    elif re.match('^[0-9]+(\\.[0-9]+)?MiB$', value):
+        return int(float(value[0:-3]) * 1024 * 1024)
+    elif re.match('^[0-9]+(\\.[0-9]+)?K$', value):
+        return int(float(value[0:-1]) * 1024)
+    elif re.match('^[0-9]+(\\.[0-9]+)?KiB$', value):
+        return int(float(value[0:-3]) * 1024)
+    elif re.match('^[0-9](\\.[0-9]+)?B$', value):
+        return int(float(value[0:-1]))
+    elif re.match('^[0-9](\\.[0-9]+)?$', value):
+        return int(float(value))
+    raise ValueError('Invalid unit in "{0}"'.format(value))
+
+
+def format_bytes(value):
+    if value < 1024 * 1.2:
+        return '{0:.2f}'.format(value)
+    value /= 1024.0
+    if value < 1024 * 1.2:
+        return '{0:.2f}K'.format(value)
+    value /= 1024.0
+    if value < 1024 * 1.2:
+        return '{0:.2f}M'.format(value)
+    value /= 1024.0
+    return '{0:.2f}G'.format(value)
+
+
+def main():
+    parser = build_arg_parser()
+    args = parser.parse_args()
+
+    level = logging.WARNING
+    if args.verbose > 1:
+        level = logging.DEBUG
+    elif args.verbose > 0:
+        level = logging.INFO
+    logging.basicConfig(level=level, format='%(message)s')
+
+    usage = get_btrfs_fi_usage(args.mount_point)
+
+    free_min = int(usage['free_min'])
+    free = int(usage['free'])
+    lost_free = free - free_min
+    fragmentation = lost_free / free * 100.0
+    warning = args.warning
+    critical = args.critical
+
+    perfdata = 'fragmentation={0}%;;;0;100 lost_free={1}B free={2}B'.format(
+        fragmentation, lost_free, free
+    )
+
+    logging.debug('Check limit {0}/{1} againt value {2} (max {3})'
+                  .format(warning, critical, format_bytes(lost_free),
+                          format_bytes(free)))
+    warning = parse_limit(warning, free)
+    critical = parse_limit(critical, free)
+    logging.debug('Raw limits are {0}/{1}'.format(warning, critical))
+
+    if critical is not None and lost_free > critical:
+        message = 'CRITICAL: Fragmentation is critical ({0:.2f}%/{1})|{2}' \
+                  .format(fragmentation, format_bytes(lost_free), perfdata)
+        status = 2
+    elif warning is not None and lost_free > warning:
+        message = 'CRITICAL: Fragmentation is warning ({0:.2f}%/{1})|{2}' \
+                  .format(fragmentation, format_bytes(lost_free), perfdata)
+        status = 1
+    else:
+        message = 'OK|{0}'.format(perfdata)
+        status = 0
+
+    print(message)
+    return status
+
+if __name__ == '__main__':
+    exit(main())
